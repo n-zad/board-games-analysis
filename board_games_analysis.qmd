@@ -1,0 +1,809 @@
+---
+title: "Analysis of the Highest Rated Board Games"
+subtitle: "ISE 201 Final Project"
+author: "Nickzad Bayati"
+format: 
+  html:
+    toc: true
+    code-fold: true
+    code-summary: "View Code"
+theme:
+  light: materia
+  dark: superhero
+editor: source
+self-contained: true
+execute: 
+  warning: false
+  error: true
+---
+
+<!-- make the light/dark mode button sticky -->
+<style>
+.top-right {
+  position: fixed;
+}
+</style>
+
+<!-- set ToC sidebar width based on window size -->
+<style>
+.sidebar {
+  width: 20vw;
+}
+</style>
+
+```{r setup}
+#| echo: false
+#| output: false
+
+library(tidyverse)
+library(reshape2)
+library(glue)
+library(performance)
+library(patchwork)
+```
+
+# Introduction
+
+I analyzed a dataset of the top-rated board games on BoardGameGeek (BGG) [[1]](#ref), the largest online board-gaming community and information resource [[2]](#ref). My goal was to identify statistical trends that might help explain why certain games achieve higher rankings than others. Such insights could be valuable to game designers developing new titles, helping them assess whether factors like increased complexity, revised player counts, or other design changes might enhance a game's appeal. My interest in this topic stems from a long-standing enjoyment of strategy board games. Additionally, my all-time favorite game, Root, is highly ranked on BGG, which motivated me to explore what characteristics differentiate top-rated games.
+
+# Data
+
+The dataset used in this analysis was published on Kaggle and was last updated in August 2025. It contains information scraped from the BGG website and includes game specifications, user ratings, popularity metrics, designer credits, and Amazon pricing data for the top 2,000 ranked board games [[1]](#ref). From the 57 available columns, I selected 15 for my analysis.
+
+| Variable          | Column          | Description                                              |
+|----------------|----------------|-----------------------------------------|
+| Overall Rank      | `rank`          | Overall ranking among all board games on BGG             |
+| Title             | `title`         | Official title of the board game                         |
+| Release Year      | `year`          | Year the game was first published                        |
+| Min Players       | `min_players`   | Minimum number of players required to play               |
+| Max Players       | `max_players`   | Maximum number of players that can play simultaneously   |
+| Min Playtime      | `min_playtime`  | Minimum playing time in minutes                          |
+| Max Playtime      | `max_playtime`  | Maximum playing time in minutes                          |
+| Min Age           | `min_age`       | Recommended minimum age for players                      |
+| Average Rating    | `avg_rating`    | Average user rating on a 1-10 scale                      |
+| Number of Reviews | `num_ratings`   | Total number of user ratings received                    |
+| Game Complexity   | `complexity`    | Game complexity/weight rating (1=simple, 5=very complex) |
+| Game Ownership    | `owned`         | Number of users who own this game                        |
+| Total Plays       | `total_plays`   | Total number of recorded plays across all users          |
+| Monthly Plays     | `monthly_plays` | Number of plays recorded in the current month            |
+| Amazon Price      | `price`         | Price of board game on Amazon, if available              |
+
+::: callout-note
+I renamed several columns for clarity and conciseness (e.g., `boardgame` &rarr; `title`, ``release_year` &rarr; `year`).
+:::
+
+The other columns were excluded either because they contained unstructured text data (e.g., game descriptions, developer names) or because they would have introduced unnecessary complexity to the analysis (e.g., detailed category rankings, granular rating distributions, BGG page-level statistics).
+
+Since I'm utilizing existing data scraped from a website, the dataset would be considered part of a retrospective observational study.
+
+## Load Dataset
+
+```{r dataset}
+bgg <- read_csv("data/boardgame-geek-dataset_organized.csv") |>
+  select(c("rank_overall", "boardgame", "release_year", "min_players", "max_players", "min_playtime", "max_playtime", "minimum_age", "avg_rating", "num_ratings", "complexity", "owned", "amazon_price", "monthly_plays", "total_plays")) |>
+  rename("rank"="rank_overall", "title"="boardgame", "year"="release_year", "min_age"="minimum_age", "price"="amazon_price")
+
+bgg
+```
+
+## Data Quality
+
+### Missing Values
+
+The `price` column is the only selected variable that contains missing data, with `r bgg |> select("price") |> is.na() |> sum()` rows lacking price values. This proportion of missing data is acceptable for the purpose of this analysis, and the variable can still be used by restricting any price-related analyses to the `r nrow(bgg) - (bgg |> select("price") |> is.na() |> sum())` rows with valid price information.
+
+```{r missing-price}
+bgg |>
+  select("price") |>
+  is.na() |>
+  sum()
+```
+
+::: callout-note
+A missing value for `price` does not mean that the game is unavailable to buy. It only indicates that the game is not currently sold on Amazon.
+:::
+
+However, during the exploratory data analysis I realized there were several columns with missing values that had been encoded as zeros.
+
+```{r missing-values}
+bgg |>
+  summarize(across(everything(), 
+                   ~sum(.x == 0, na.rm=TRUE))) |>
+  pivot_longer(cols = everything(),
+               names_to = "column",
+               values_to = "zero_count") |>
+  filter(zero_count > 0)
+```
+
+As shown in the table, there are only a small number of instances where zero is used as a placeholder for missing data. Additionally, the zeros in the `monthly_plays` column are legitimate values because it is possible for a game to have no recorded plays during the month in which the data was scraped.
+
+::: callout-note
+The values for the `ownership`, `total_plays`, and `monthly_plays` columns are based on self-reported data from BGG users.
+:::
+
+### Outliers
+
+Several variables contained a small number of outliers, as shown in Tables A1--A7 in the Appendix. Since these values are plausible and do not appear to be data-entry errors, I am leaving them in the dataset.
+
+# Exploratory Data Analysis (EDA)
+
+Before addressing the research question, it is helpful to conduct exploratory data analysis (EDA) to better understand the structure and characteristics of the dataset.
+
+::: callout-note
+Visualizations of each variable ordered by rank are included in the Appendix.
+:::
+
+## Game Information
+
+To provide a general overview of the game information variables, key summary statistics are presented below.
+
+```{r game-info}
+bgg |>
+  filter(year != 0 & min_playtime != 0 & max_playtime != 0 & min_age != 0) |>
+  summarize(across(
+    c("year", "min_players", "max_players", "min_playtime", "max_playtime", "min_age", "complexity"),
+    c("min"=min, "max"=max, "avg"=mean, "median"=median, "sd"=sd)
+    )) |>
+  pivot_longer(cols = everything(),
+               names_to = c("variable", "stat"),
+               names_pattern = "(.*)_(min|max|avg|median|sd)"
+               ) |>
+  pivot_wider(names_from = stat,
+              values_from = value)
+```
+
+These summary statistics are consistent with typical board game design conventions, where most games accommodate 2 to 4 players and have playtimes centered around 45 to 90 minutes. This provides a useful reference point for later interpretations, as deviations from these common ranges may indicate unusual or niche titles.
+
+To examine internal consistency and typical ranges across game specifications, scatterplots of minimum versus maximum values are shown below for playtime and player count.
+
+```{r min-max-players-playtime}
+#| fig-width: 8
+
+p1 <- bgg |>
+  ggplot(aes(x = min_players, y = max_players)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_count(aes(color = after_stat(n)), size = 2, alpha = 0.75) +
+  scale_color_gradient(low = "mediumpurple1", high = "purple4") +
+  labs(title = "Min Players vs Max Players",
+       x = "Min Players",
+       y = "Max Players",
+       color = "Count") +
+  theme(legend.position = c(0.95, 0.95),
+        legend.justification = c(1, 1))
+
+p2 <- bgg |>
+  filter(min_playtime != 0 & max_playtime != 0) |>
+  ggplot(aes(x = min_playtime, y = max_playtime)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_count(aes(color = after_stat(n)), size = 2, alpha = 0.75) +
+  scale_color_gradient(low = "dodgerblue", high = "navy") +
+  labs(title = "Min Playtime vs Max Playtime",
+       x = "Min Playtime (minutes)",
+       y = "Max Playtime (minutes)",
+       color = "Count") +
+  theme(legend.position = c(0.95, 0.95),
+        legend.justification = c(1, 1))
+
+p1 + p2
+```
+
+Most games lie close to the diagonal, indicating narrow specification ranges and consistent values across titles. Playtime shows a wider spread than player count, which is expected given the greater variation in gameplay durations. A few games have large gaps between minimum and maximum values, suggesting niche titles with highly variable play experiences. These patterns help contextualize the variability of game design.
+
+## BGG Users
+
+BoardGameGeek tracks several forms of user engagement, most notably the number of ratings a game receives on BGG and its average user rating.
+
+```{r user-rating}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  ggplot(aes(x = rank, y = num_ratings, fill = avg_rating)) +
+  geom_col() +
+  scale_y_continuous(breaks = seq(0, 140000, by=20000),
+                     labels = ~ifelse(.x == 0, "0", paste0(.x / 1000, "k"))) +
+  scale_fill_gradient(low = "red", high = "green3") +
+  labs(title = "Rank vs User Ratings",
+       x = "Overall Rank",
+       y = "Review Count",
+       fill = "Average Rating") +
+  theme(legend.position = c(0.95, 0.95),
+        legend.justification = c(1, 1))
+```
+
+Higher-ranked games consistently receive many more user ratings, indicating that rank is strongly linked to community engagement. Games with only modest numbers of ratings almost never appear near the top of the rankings.
+
+BoardGameGeek also collects user engagement data through game ownership counts and play logs, where users record how many times they have played each game.
+
+```{r user-own-plays}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  ggplot(aes(x = rank)) +
+  geom_line(aes(y = owned), color = "forestgreen", alpha = 0.5) +
+  geom_smooth(aes(y = owned), method = "lm", color = "forestgreen") +
+  geom_line(aes(y = total_plays), color = "steelblue", alpha = 0.5) +
+  geom_smooth(aes(y = total_plays), method = "lm", color = "steelblue") +
+  geom_line(aes(y = monthly_plays), color = "tomato", alpha = 0.5) +
+  geom_smooth(aes(y = monthly_plays), method = "lm", color = "tomato") +
+  scale_y_continuous(trans = "log10", labels = scales::comma) +
+  labs(title = "Rank vs User Play Totals and Game Ownership",
+       x = "Overall Rank",
+       y = "Count (log base 10)",
+       subtitle = "(Green = owned, Blue = total_plays, Red = monthly_plays)")
+```
+
+Keeping in mind that the 2nd plot has a logarithmic scale for the y-axis, `monthly_plays` has a very sharp decrease as we go down the ranks. Which makes sense, but I find it interesting that `total_plays` and `owned`, while also decreasing significantly, is doing so at a lower rate.
+
+## Price
+
+To explore the price variable, summary statistics are presented below. Records with a reported price of zero are excluded to avoid distortions from missing values.
+
+```{r price-stats}
+bgg |>
+  filter(price > 0) |>
+  summarize("Value" = quantile(price)) |>
+  mutate("Price Statistic" = c("Min", "Q1", "Median", "Q3", "Max"), .before = "Value")
+```
+
+While better ranked games do cost more (slope: `r round(coef(lm(price ~ rank, data = filter(bgg, price > 0)))["rank"], 3)`, from Figure A13 in the Appendix), it is a barely significant trend. There are also several outliers for price, which could influence the regression line.
+
+## Summary
+
+Overall, the EDA revealed clear structure across the three categories of variables. Game information variables followed familiar design patterns, with most titles supporting 2–4 players and moderate playtimes, and with strong correlations among attributes such as complexity and playtime. User engagement variables showed pronounced skewness, with highly ranked games receiving disproportionately large numbers of ratings, plays, and ownership counts. Price data was more dispersed but generally consistent with typical market ranges. Together, these observations provide important context for later modeling and highlight which variables are most likely to influence overall rank.
+
+Figures A1--A13 in the Appendix display how each individual variable relates to `rank`.
+
+# Inference
+
+While the EDA section focused on examining the existing dataset, this section applies inferential methods, specifically regression analysis and principal component analysis, to identify relationships and underlying structure within the data.
+
+## Regression Analysis
+
+### Simple Linear Regression
+
+As shown in Figures A7--A13 in the Appendix, all variables that are not restricted to a small set of discrete values (`avg_rating`, `num_ratings`, `complexity`, `owned`, `total_plays`, `monthly_plays`, and `price`) have simple linear regression lines with negative slopes, indicating at least a slight negative correlation with rank. Because a lower numerical rank corresponds to a better rank, this implies that higher-ranked games tend to have higher values for these variables.
+
+### Multiple Linear Regression
+
+After examining the variables individually, the natural next step is to predict `rank` using all variables jointly.
+
+```{r linear-regression1}
+model <- bgg |>
+  select(-title, -price) |>
+  lm(formula = rank ~ ., data = _)
+
+summary(model)
+```
+
+::: callout-note
+The `price` variable is excluded from multiple linear regression due to its substantial number of missing values.
+:::
+
+Based on the $Pr(>|t|)$ values, `max_playtime`, `min_age`, `avg_rating`, `num_ratings`, `owned`, `monthly_plays`, and `total_plays` are statistically significant predictors of `rank`. This suggests that a model only uses those variables could achieve better performance.
+
+```{r linear-regression2}
+model2 <- bgg |>
+  select(-title, -price, -year, -min_players, -max_players, -min_playtime, -complexity) |>
+  lm(formula = rank ~ ., data = _)
+
+summary(model2)
+```
+
+The reduced model performs slightly better, showing a small improvement in adjusted $R^2$ and reduced noise due to the removal of non-significant predictors. The estimated coefficients indicate that `min_age`, `avg_rating`, `num_ratings`, and `monthly_plays` are associated with better (lower) ranks.
+
+### Approach Validation
+
+The regression results need to be validated by checking model assumptions and inspecting diagnostic residual plots.
+
+```{r linear-regession-validation}
+#| fig-width: 8
+#| fig-height: 8
+
+par(mfrow=c(2,2))
+plot(model2)
+```
+
+However, the plots indicate that several key assumptions are violated:
+
+1) **Nonlinearity:** the Residuals vs. Fitted plot shows a U-shaped line, suggesting that the relationship between the response and regressors is not linear.  
+2) **Non-normal errors:** the Normal Q-Q plot does not follow the reference line, indicating that errors are not normally distributed.  
+3) **Non-constant variance:** the Scale-Location plotted line is not horizontal, indicating non-constant error variance.  
+4) **High-leverage observations:** the Residuals vs Leverage plot shows several points near the threshold, indicating that those points exert disproportionate influence over the model fit.  
+
+Given these violations, the model cannot be considered valid in its current form.
+
+### Fix Attempt
+
+To address the nonlinearity between the response variable and the predictors, the response variable can be transformed. A common approach is to apply a logarithmic transformation to the response variable.
+
+```{r linear-regression3}
+model3 <- bgg |>
+  select(-title, -price, -year, -min_players, -max_players, -min_playtime, -complexity) |>
+  lm(formula = log(rank) ~ ., data = _)
+
+summary(model3)
+```
+
+The transformed model performs better, showing a significant improvement in adjusted $R^2$. The estimated coefficients indicate that the same variables (`min_age`, `avg_rating`, `num_ratings`, and `monthly_plays`) remain associated with better (lower) ranks.
+
+```{r linear-regession-validation2}
+#| fig-width: 8
+#| fig-height: 8
+
+par(mfrow=c(2,2))
+plot(model3)
+```
+
+The new diagnostic plots shows partial improvements:
+
+1) **Linearity:** the Residuals vs. Fitted plot now shows only a slightly curved line, suggesting that the relationship between the response and regressors could be approximately linear.  
+2) **Less non-normality:** the Normal Q-Q plot now shows an S-shaped pattern, indicating that errors still are not normally distributed, but no longer heavily skews to one side.  
+3) **Stable non-constant variance:** the Scale-Location plotted line, although diagonal, is nearly straight, indicating that error variance is more stable but isn't constant.  
+4) **High-leverage observations:** the Residuals vs Leverage plot now shows two points past the threshold, indicating that those points exert even more disproportionate influence over the model fit.  
+
+While the transformation improves linearity, the most important assumption, and provides partial improvements in other areas, the model still does not fully satisfy all regression assumptions. While not completely validated, the transformed model is more appropriate than the original, but it remains imperfect and should be interpreted with caution.
+
+### Multicollinearity
+
+The estimated coefficients may be unreliable if multicollinearity is present among the regressors. This can be assessed by examining variance inflation factors (VIFs).
+
+```{r multicollinearity}
+check_collinearity(model3)
+```
+
+The variables `num_ratings` and `owned` show very high VIF values, indicating substantial multicollinearity. To improve the interpretability of the coefficient estimates, one of these variables should be removed. Because `num_ratings` is likely a more reliable indicator of popularity, `owned` is going to be excluded from the model.
+
+```{r multicollinearity2}
+model4 <- bgg |>
+  select(-title, -price, -year, -min_players, -max_players, -min_playtime, -complexity, -owned) |>
+  lm(formula = log(rank) ~ ., data = _)
+
+check_collinearity(model4)
+```
+
+With multicollinearity addressed, the remaining coefficients should be more stable and interpretable.
+
+```{r linear-regession-final-coefficients}
+summary(model4)$coefficients[, "Estimate"] |> 
+  as_tibble(rownames = "x") |>
+  rename("estimated_coefficient" = value)
+```
+
+Notably, the estimated coefficients still show that `min_age`, `avg_rating`, `num_ratings`, and `monthly_plays` are associated with better (lower) ranks, which is consistent with patterns observed in the earlier models.
+
+## Principal Component Analysis (PCA)
+
+### Viability
+
+Principal Component Analysis works better on data that has at least some positive or negative correlation between variables, and a heatmap is a great way to visualize correlation.
+
+```{r correlation-plot}
+bgg |>
+  select(-c("rank", "title", "price")) |>
+  cor() |>
+  round(2) |>
+  melt() |>
+  ggplot(aes(x=Var1, y=Var2, fill=value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white",
+                       midpoint = 0, limit = c(-1,1), space = "Lab",
+                       name="Correlation") +
+  labs(title = "Correlation Heatmap") +
+  theme(axis.text.x = element_text(angle=45, vjust=1.1, hjust=1.1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+```
+
+The heatmap shows that there are two distinct groups of positively correlated variables:
+
+1) `total_plays`, `monthly_plays`, `owned`, and `num_ratings`
+2) `complexity`, `avg_rating`, `min_age`, `max_playtime`, and `min_playtime`
+
+This indicates that PCA is viable, as the correlated variables could have a larger proportion of their variance captured using fewer components.
+
+::: callout-note
+The `price` variable is excluded from PCA due to its substantial number of missing values.
+:::
+
+### Scree Plot
+
+A scree plot shows the proportion of variance explained (PVE) by each principal component. A common approach for selecting the number of components is the elbow method, which identifies the point at which additional components provide diminishing returns in explained variance by examining the slope between successive points.
+
+```{r scree-plot}
+pca_all <- bgg |>
+  select(-c("rank", "title", "price")) |>
+  prcomp(center = TRUE, scale. = TRUE)
+
+summary(pca_all)$importance["Proportion of Variance",] |>
+  as_tibble() |>
+  rownames_to_column(var = "PC") |>
+  ggplot(aes(x = factor(PC, levels=1:12), y = value, group = 1)) +
+  geom_path(color = "dodgerblue4") +
+  geom_point(size = 2, color = "dodgerblue2") +
+  scale_y_continuous(breaks = seq(0, 0.3, by=0.025)) +
+  labs(title = "Scree Plot: Proportion of Variance Explained (PVE)",
+       x = "Principal Component",
+       y = "PVE")
+```
+
+Using the elbow method, the plot suggests that the first two principal components are sufficient, as the curve flattens noticeably after the second component. As demonstrated in the next section, these two components provide a useful two-dimensional representation of the twelve variables included in the PCA.
+
+### Visualization
+
+PCA allows multiple variables to be projected into two dimensions using the first two principal components, and this two-dimensional representation can help reveal patterns that may not be visible in the original feature space.
+
+```{r pca-plot}
+pca <- bgg |>
+  select(-c("rank", "title", "price")) |>
+  prcomp(center = TRUE, scale. = TRUE, rank. = 2)
+
+cumulative = summary(pca)$importance["Cumulative Proportion", "PC2"]
+
+pca$x |>
+  as_tibble() |>
+  mutate("rank" = pull(bgg, rank)) |>
+  ggplot(aes(x = PC1, y = PC2, color = rank)) +
+  geom_point(size = 1) +
+  scale_color_gradient(low = "green3", high = "red2") +
+  labs(title = glue("PCA Using Two Components (Variance Captured: {format(cumulative*100, digits=2, nsmall=2)}%)"),
+       color = "Overall Rank")
+```
+
+In the visualization, games ranked between roughly 750 and 2000 form a dense, elongated cluster, while higher-ranking games extend outward toward the upper-right region. To make sense of this information, we need to analyze which variables influence the first two principal components the most.
+
+### Coefficient Interpretation
+
+Each principal component is a linear combination of the original variables, with each variable weighted by its corresponding coefficient. These coefficients, or loadings, indicate how strongly a variable contributes to the component and whether its contribution is positive or negative.
+
+```{r pca-coef}
+round(pca$rotation[, c("PC1", "PC2")], 3) |>
+  as_tibble(rownames = "variable")
+```
+
+The three variables with the largest coefficients for the first two principal components are:
+
+PC1: `total_plays`, `owned`, `num_ratings`  
+PC2: `complexity`, `avg_rating`, `max_playtime`
+
+Which implies that these variables caused the observed spread of the higher-ranking games in the PCA visualization. As expected, the first component is heavily influenced by popularity-related variables, which as seen in Figures A8, A10, and A11 (see Appendix) have significantly higher values for higher-ranked games. However, the second component is heavily influenced by `complexity` and `max_playtime`, two variables that are not directly related to popularity.
+
+# Conclusion
+
+This analysis shows that popularity-related variables (such as `total_plays`, `num_ratings`, and `owned`) are strongly associated with a game’s overall rank. However, several non-popularity factors also play meaningful roles. The multiple linear regression models identified `min_age` as a significant predictor of rank, indicating that games aimed at older audiences could achieve a better rank. PCA further revealed that `complexity` and `max_playtime` significantly contribute to variation across titles, suggesting that complicated and longer games occupy a distinct space in the game landscape, which could lead to a better rank. Together, these findings indicate that both player engagement metrics and certain game characteristics may influence how highly a game is rated on BGG.
+
+At the same time, the study has several limitations. The dataset includes some missing values, relies on self-reported user data, and is restricted to the variables available through the original scraping process. In addition, the linear regression models violate several core assumptions, which may affect the interpretability of coefficient estimates. Finally, because the analysis is based on observational data and correlational methods, it cannot determine whether specific game characteristics cause higher or lower BGG rankings.
+
+Future work could incorporate additional variables such as game theme, publisher, release trends (e.g., holiday-season launches), or marketing indicators (e.g., crowdfunding data, award nominations), and could explore more advanced modeling approaches (e.g., decision trees, clustering). Given the limitations of the linear regression models, future work could also explore ordinal regression, which is better suited to ordered outcomes like rank. Combining more variables with more sophisticated models may lead to a deeper understanding of the factors that contribute to a game’s success on BoardGameGeek.
+
+# References {#ref}
+
+<!-- modify ordered list to surround numbers with brackets -->
+<style>
+.bracketed ol {
+  list-style: none;
+  padding-left: 0;
+  counter-reset: bracketed-counter;
+}
+.bracketed ol > li {
+  counter-increment: bracketed-counter;
+  margin-left: 2.5em;
+  margin-bottom: 1em;
+}
+.bracketed ol > li::before {
+  content: "[" counter(bracketed-counter) "] ";
+  display: inline-block;
+  width: 2em;
+  margin-left: -2.5em;
+}
+.bracketed ol > li > p {
+  display: inline;
+  margin: 0;
+}
+</style>
+
+::: bracketed
+1.  Chik0di, "Board Games Dataset Complete Features," Kaggle.com, 2024. https://www.kaggle.com/datasets/chik0di/board-games-dataset-complete-features/data (accessed Dec. 04, 2025).
+
+2.  Boardgamegeek, "BoardGameGeek \| Gaming Unplugged Since 2000," boardgamegeek.com. https://boardgamegeek.com/.
+:::
+
+# Appendix
+
+The following plots display each selected variable plotted against overall rank. These figures are referenced in the EDA section but are presented here to keep the main analysis concise.
+
+## Figure A1. Release Year
+
+```{r year-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  filter(year > 1970) |>
+  ggplot(aes(x = rank, y = year)) +
+  geom_point(size = 1, color = "goldenrod") +
+  scale_y_continuous(breaks = seq(1960, 2025, by=5)) +
+  labs(title = "Rank vs Release Year",
+       x = "Overall Rank",
+       y = "Release Year")
+```
+
+## Table A1. Outliers for Release Year
+
+```{r year-outliers}
+bgg |>
+  filter(year <= 1970) |>
+  select(c("rank", "year", "title"))
+```
+
+## Figure A2. Minimum Players
+
+```{r min-players-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  ggplot(aes(x = rank, y = min_players)) +
+  geom_jitter(width = 0, height = 0.15, size = 1, color = "royalblue") +
+  scale_y_continuous(breaks = seq(1, 8)) +
+  labs(title = "Rank vs Minimum Player Count",
+       x = "Overall Rank",
+       y = "Min Player Count")
+```
+
+## Figure A3. Maximum Players
+
+```{r max-players-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  filter(max_players <= 15) |>
+  ggplot(aes(x = rank, y = max_players)) +
+  geom_jitter(width = 0, height = 0.1, size = 1, color = "darkorchid") +
+  scale_y_continuous(breaks = seq(1, 20)) +
+  labs(title = "Rank vs Maximum Player Count",
+       x = "Overall Rank",
+       y = "Max Player Count")
+```
+
+## Table A2. Outliers for Maximum Players
+
+```{r max-players-outliers}
+bgg |>
+  filter(max_players > 15) |>
+  select(c("rank", "max_players", "title"))
+```
+
+## Figure A4. Minimum Playtime
+
+```{r min-playtime-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  filter(min_playtime > 0 & min_playtime <= 400) |>
+  ggplot(aes(x = rank, y = min_playtime)) +
+  geom_jitter(width = 0, height = 3, size = 1, color = "coral") +
+  scale_y_continuous(breaks = seq(0, 400, by=30)) +
+  labs(title = "Rank vs Minimum Estimated Playtime",
+       x = "Overall Rank",
+       y = "Min Playtime (minutes)")
+```
+
+## Table A3. Outliers for Minimum Playtime
+
+::: columns
+::: column
+**(a) Low Outliers**
+```{r min-playtime-outliers-low}
+bgg |>
+  filter(min_playtime == 0) |>
+  select(c("rank", "min_playtime", "title"))
+```
+:::
+::: column
+**(b) High Outliers**
+```{r min-playtime-outliers-high}
+bgg |>
+  filter(min_playtime > 400) |>
+  select(c("rank", "min_playtime", "title"))
+```
+:::
+:::
+
+## Figure A5. Maximum Playtime
+
+```{r max-playtime-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  filter(max_playtime > 0 & max_playtime <= 500) |>
+  ggplot(aes(x = rank, y = max_playtime)) +
+  geom_jitter(width = 0, height = 3, size = 1, color = "coral4") +
+  scale_y_continuous(breaks = seq(0, 500, by=30)) +
+  labs(title = "Rank vs Maximum Estimated Playtime",
+       x = "Overall Rank",
+       y = "Max Playtime (minutes)")
+```
+
+## Table A4. Outliers for Maximum Playtime
+
+::: columns
+::: column
+**(a) Low Outliers**
+```{r max-playtime-outliers-low}
+bgg |>
+  filter(max_playtime == 0) |>
+  select(c("rank", "max_playtime", "title"))
+```
+:::
+::: column
+**(b) High Outliers**
+```{r max-playtime-outliers-high}
+bgg |>
+  filter(max_playtime > 500) |>
+  select(c("rank", "max_playtime", "title"))
+```
+:::
+:::
+
+## Figure A6. Minimum Age
+
+```{r min-age-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  filter(min_age > 0) |>
+  ggplot(aes(x = rank, y = min_age)) +
+  geom_jitter(width = 0, height = 0.1, size = 1, color = "mediumvioletred") +
+  scale_y_continuous(breaks = seq(1, 20)) +
+  labs(title = "Rank vs Minimum Age",
+       x = "Overall Rank",
+       y = "Min Age (years)")
+```
+
+## Table A5. Outliers for Minimum Age
+
+```{r min-age-outliers}
+bgg |>
+  filter(min_age == 0) |>
+  select(c("rank", "min_age", "title"))
+```
+
+## Figure A7. Average User Rating
+
+```{r avg-rating-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  ggplot(aes(x = rank, y = avg_rating)) +
+  geom_point(size = 1, color = "limegreen") +
+  geom_smooth(method = "lm", color = "green4") +
+  scale_y_continuous(breaks = seq(6.5, 9.5, by=0.5)) +
+  labs(title = "Rank vs Average User Rating",
+       x = "Overall Rank",
+       y = "Avg Rating")
+```
+
+## Figure A8. Number of User Ratings
+
+```{r num-ratings-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  ggplot(aes(x = rank, y = num_ratings)) +
+  geom_point(size = 1, color = "aquamarine3") +
+  geom_smooth(method = "lm", color = "aquamarine4") +
+  scale_y_continuous(breaks = seq(0, 140000, by=20000),
+                     labels = ~ifelse(.x == 0, "0", paste0(.x / 1000, "k"))) +
+  labs(title = "Rank vs Number of User Ratings",
+       x = "Overall Rank",
+       y = "Number of Ratings")
+```
+
+## Figure A9. Game Complexity
+
+```{r complexity-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  ggplot(aes(x = rank, y = complexity)) +
+  geom_point(size = 1, color = "sienna1") +
+  geom_smooth(method = "lm", color = "sienna") +
+  labs(title = "Rank vs Game Complexity",
+       x = "Overall Rank",
+       y = "Complexity Score")
+```
+
+## Figure A10. Recorded Game Ownership
+
+```{r ownded-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  ggplot(aes(x = rank, y = owned)) +
+  geom_point(size = 1, color = "steelblue2") +
+  geom_smooth(method = "lm", color = "steelblue4") +
+  scale_y_continuous(breaks = seq(0, 240000, by=30000),
+                     labels = ~ifelse(.x == 0, "0", paste0(.x / 1000, "k"))) +
+  labs(title = "Rank vs Recorded Game Ownership",
+       x = "Overall Rank",
+       y = "Recorded Game Ownership")
+```
+
+## Figure A11. Total Recorded Plays
+
+```{r total-plays-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  ggplot(aes(x = rank, y = total_plays)) +
+  geom_point(size = 1, color = "slateblue1") +
+  geom_smooth(method = "lm", color = "slateblue4") +
+  scale_y_continuous(breaks = seq(0, 900000, by=100000),
+                     labels = ~ifelse(.x == 0, "0", paste0(.x / 1000, "k"))) +
+  labs(title = "Rank vs Total Recorded Plays",
+       x = "Overall Rank",
+       y = "Total Recorded Plays")
+```
+
+## Figure A12. Monthly Recorded Plays
+
+```{r monthly-plays-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  ggplot(aes(x = rank, y = monthly_plays)) +
+  geom_point(size = 1, color = "mediumpurple2") +
+  geom_smooth(method = "lm", color = "mediumpurple4") +
+  scale_y_continuous(breaks = seq(0, 16000, by=1000),
+                     limits = c(-250, 7250),
+                     labels = ~ifelse(.x == 0, "0", paste0(.x / 1000, "k"))) +
+  labs(title = "Rank vs Monthly Recorded Plays",
+       x = "Overall Rank",
+       y = "Monthly Recorded Plays")
+```
+
+## Table A6. Outliers for Monthly Recorded Plays
+
+```{r monthly-plays-outliers}
+bgg |>
+  filter(monthly_plays > 8000) |>
+  select(c("rank", "monthly_plays", "title"))
+```
+
+## Figure A13. Amazon Price
+
+```{r price-plot}
+#| fig-width: 8
+#| fig-height: 4
+
+bgg |>
+  filter(!is.na(price)) |>
+  ggplot(aes(x = rank, y = price)) +
+  geom_point(size = 1, color = "firebrick1") +
+  geom_smooth(method = "lm", color = "firebrick3") +
+  scale_y_continuous(breaks = seq(0, 1000, by=100),
+                     limits = c(0, 400)) +
+  labs(title = "Rank vs Amazon Price",
+       x = "Overall Rank",
+       y = "Price (USD)")
+```
+
+## Table A7. Outliers for Amazon Price
+
+```{r price-outliers}
+bgg |>
+  filter(price > 400) |>
+  select(c("rank", "price", "title"))
+```
